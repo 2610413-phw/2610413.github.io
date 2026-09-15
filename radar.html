@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>micro:bit Radar</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-height: 100vh;
+    background: #07110d;
+    color: #b8ffd0;
+    font-family: Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  header {
+    width: 100%;
+    max-width: 900px;
+    padding: 18px 16px 8px;
+    text-align: center;
+  }
+
+  h1 {
+    margin: 0 0 8px;
+    font-size: 28px;
+    letter-spacing: 2px;
+  }
+
+  #status {
+    min-height: 22px;
+    font-size: 14px;
+    opacity: 0.9;
+  }
+
+  #connectBtn {
+    margin: 12px 0 8px;
+    padding: 12px 22px;
+    border: 1px solid #45ff91;
+    border-radius: 8px;
+    background: #0b2417;
+    color: #b8ffd0;
+    font-size: 16px;
+    cursor: pointer;
+  }
+
+  #connectBtn:active { transform: scale(0.98); }
+
+  #connectBtn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  main {
+    width: 100%;
+    max-width: 900px;
+    padding: 8px 12px 24px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  canvas {
+    width: min(94vw, 760px);
+    height: auto;
+    display: block;
+    background: #020805;
+    border: 1px solid #1b5a38;
+    border-radius: 10px;
+  }
+
+  .info {
+    width: min(94vw, 760px);
+    margin-top: 12px;
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+  }
+
+  .box {
+    background: #0a1b12;
+    border: 1px solid #17472d;
+    border-radius: 8px;
+    padding: 12px;
+    text-align: center;
+  }
+
+  .label {
+    display: block;
+    font-size: 12px;
+    opacity: 0.7;
+    margin-bottom: 5px;
+  }
+
+  .value {
+    font-size: 19px;
+    font-weight: bold;
+  }
+
+  .help {
+    width: min(94vw, 760px);
+    margin-top: 12px;
+    padding: 12px;
+    border: 1px solid #17472d;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.6;
+    opacity: 0.85;
+  }
+
+  @media (max-width: 600px) {
+    h1 { font-size: 23px; }
+    .info { grid-template-columns: 1fr 1fr; }
+    .box:last-child { grid-column: 1 / -1; }
+  }
+</style>
+</head>
+
+<body>
+<header>
+  <h1>MICRO:BIT RADAR</h1>
+  <div id="status">연결되지 않음</div>
+  <button id="connectBtn">micro:bit 연결</button>
+</header>
+
+<main>
+  <canvas id="radar" width="760" height="440"></canvas>
+
+  <div class="info">
+    <div class="box">
+      <span class="label">현재 각도</span>
+      <span class="value" id="angle">--°</span>
+    </div>
+    <div class="box">
+      <span class="label">거리</span>
+      <span class="value" id="distance">-- cm</span>
+    </div>
+    <div class="box">
+      <span class="label">수신 데이터</span>
+      <span class="value" id="packet">0</span>
+    </div>
+  </div>
+
+  <div class="help">
+    micro:bit가 <b>angle,distance</b> 형식으로 Bluetooth UART 데이터를 보내면
+    레이더 화면에 자동으로 표시됩니다.
+  </div>
+</main>
+
+<script>
+/*
+  micro:bit UART UUID
+  Service : 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+  TX/Notify (micro:bit -> tablet):
+           6e400003-b5a3-f393-e0a9-e50e24dcca9e
+  RX/Write (tablet -> micro:bit):
+           6e400002-b5a3-f393-e0a9-e50e24dcca9e
+*/
+
+const UART_SERVICE =
+  "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+
+const UART_TX =
+  "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+
+const UART_RX =
+  "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+
+const canvas = document.getElementById("radar");
+const ctx = canvas.getContext("2d");
+
+const connectBtn = document.getElementById("connectBtn");
+const statusEl = document.getElementById("status");
+const angleEl = document.getElementById("angle");
+const distanceEl = document.getElementById("distance");
+const packetEl = document.getElementById("packet");
+
+let device = null;
+let txCharacteristic = null;
+let rxCharacteristic = null;
+
+let currentAngle = 0;
+let currentDistance = 0;
+let packetCount = 0;
+
+let receivedBuffer = "";
+
+// 최근 감지 위치
+const detections = new Map();
+
+function setStatus(text) {
+  statusEl.textContent = text;
+}
+
+// Web Bluetooth 지원 여부
+if (!("bluetooth" in navigator)) {
+  setStatus("이 브라우저는 Web Bluetooth를 지원하지 않습니다.");
+  connectBtn.disabled = true;
+}
+
+// 연결 버튼
+connectBtn.addEventListener("click", connectBluetooth);
+
+async function connectBluetooth() {
+  if (!window.isSecureContext) {
+    setStatus("HTTPS 페이지에서 실행해야 합니다.");
+    return;
+  }
+
+  if (!navigator.bluetooth) {
+    setStatus("Web Bluetooth를 사용할 수 없습니다.");
+    return;
+  }
+
+  try {
+    connectBtn.disabled = true;
+    setStatus("micro:bit 선택창을 여는 중...");
+
+    device = await navigator.bluetooth.requestDevice({
+      filters: [
+        { services: [UART_SERVICE] }
+      ],
+      optionalServices: [UART_SERVICE]
+    });
+
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    setStatus("micro:bit에 연결하는 중...");
+
+    const server = await device.gatt.connect();
+
+    const service = await server.getPrimaryService(UART_SERVICE);
+
+    // micro:bit -> 태블릿 데이터 수신용
+    txCharacteristic = await service.getCharacteristic(UART_TX);
+
+    // 태블릿 -> micro:bit 데이터 전송용
+    rxCharacteristic = await service.getCharacteristic(UART_RX);
+
+    await txCharacteristic.startNotifications();
+
+    txCharacteristic.addEventListener(
+      "characteristicvaluechanged",
+      handleUARTData
+    );
+
+    setStatus("연결 완료: " + (device.name || "micro:bit"));
+    connectBtn.textContent = "연결됨";
+
+  } catch (error) {
+    console.error(error);
+
+    if (error.name === "NotFoundError") {
+      setStatus("micro:bit 선택이 취소되었습니다.");
+    } else {
+      setStatus("연결 실패: " + error.message);
+    }
+
+    connectBtn.disabled = false;
+    connectBtn.textContent = "micro:bit 연결";
+  }
+}
+
+function onDisconnected() {
+  setStatus("micro:bit 연결이 끊어졌습니다.");
+  connectBtn.disabled = false;
+  connectBtn.textContent = "micro:bit 연결";
+
+  txCharacteristic = null;
+  rxCharacteristic = null;
+}
+
+function handleUARTData(event) {
+  const decoder = new TextDecoder();
+  receivedBuffer += decoder.decode(event.target.value);
+
+  let lines = receivedBuffer.split("\n");
+  receivedBuffer = lines.pop();
+
+  for (let line of lines) {
+    line = line.trim();
+
+    if (!line) continue;
+
+    parseRadarData(line);
+  }
+}
+
+function parseRadarData(data) {
+  // 예상 형식: 90,35
+  const parts = data.split(",");
+
+  if (parts.length !== 2) return;
+
+  const angle = Number(parts[0]);
+  const distance = Number(parts[1]);
+
+  if (!Number.isFinite(angle) || !Number.isFinite(distance)) return;
+
+  if (angle < 0 || angle > 180) return;
+  if (distance < 0) return;
+
+  currentAngle = angle;
+  currentDistance = distance;
+  packetCount++;
+
+  angleEl.textContent = angle.toFixed(0) + "°";
+  distanceEl.textContent = distance.toFixed(1) + " cm";
+  packetEl.textContent = packetCount;
+
+  // 최대 표시 거리 200cm
+  const maxDistance = 200;
+
+  if (distance <= maxDistance) {
+    detections.set(angle, {
+      distance: distance,
+      time: performance.now()
+    });
+  }
+
+  drawRadar();
+}
+
+/*
+  레이더 화면
+  중심 = (canvas 중앙, 아래쪽)
+  0° = 왼쪽
+  90° = 위쪽
+  180° = 오른쪽
+*/
+function drawRadar() {
+  const w = canvas.width;
+  const h = canvas.height;
+
+  ctx.clearRect(0, 0, w, h);
+
+  const centerX = w / 2;
+  const centerY = h - 25;
+  const radius = Math.min(w * 0.46, h * 0.88);
+
+  // 배경
+  ctx.fillStyle = "#020805";
+  ctx.fillRect(0, 0, w, h);
+
+  // 레이더 격자
+  ctx.strokeStyle = "#15532f";
+  ctx.lineWidth = 2;
+
+  // 반원
+  for (let i = 1; i <= 4; i++) {
+    const r = radius * i / 4;
+
+    ctx.beginPath();
+    ctx.arc(
+      centerX,
+      centerY,
+      r,
+      Math.PI,
+      2 * Math.PI
+    );
+    ctx.stroke();
+  }
+
+  // 세로 중앙선
+  ctx.beginPath();
+  ctx.moveTo(centerX, centerY);
+  ctx.lineTo(centerX, centerY - radius);
+  ctx.stroke();
+
+  // 각도선
+  for (let angle = 30; angle < 180; angle += 30) {
+    const rad = Math.PI - angle * Math.PI / 180;
+
+    const x = centerX + Math.cos(rad) * radius;
+    const y = centerY - Math.sin(rad) * radius;
+
+    ctx.beginPath();
+    ctx.moveTo(centerX, centerY);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  }
+
+  // 거리 표시
+  ctx.fillStyle = "#4dbb75";
+  ctx.font = "12px Arial";
+  ctx.textAlign = "center";
+
+  for (let i = 1; i <= 4; i++) {
+    const r = radius * i / 4;
+
+    ctx.fillText(
+      Math.round(200 * i / 4) + " cm",
+      centerX,
+      centerY - r - 5
+    );
+  }
+
+  // 각도 표시
+  ctx.font = "13px Arial";
+
+  for (let angle = 0; angle <= 180; angle += 30) {
+    const rad = Math.PI - angle * Math.PI / 180;
+
+    const labelR = radius + 18;
+
+    const x = centerX + Math.cos(rad) * labelR;
+    const y = centerY - Math.sin(rad) * labelR;
+
+    ctx.fillText(angle + "°", x, y);
+  }
+
+  // 감지된 물체
+  const now = performance.now();
+
+  for (const [angle, obj] of detections) {
+    // 1.5초 이상 지난 데이터는 삭제
+    if (now - obj.time > 1500) {
+      detections.delete(angle);
+      continue;
+    }
+
+    const distance = Math.min(obj.distance, 200);
+
+    const r = radius * distance / 200;
+    const rad = Math.PI - angle * Math.PI / 180;
+
+    const x = centerX + Math.cos(rad) * r;
+    const y = centerY - Math.sin(rad) * r;
+
+    ctx.beginPath();
+    ctx.arc(x, y, 7, 0, Math.PI * 2);
+
+    ctx.fillStyle = "#7dffae";
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.arc(x, y, 13, 0, Math.PI * 2);
+
+    ctx.strokeStyle = "#39d878";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // 현재 스캔 방향
+  const scanRad = Math.PI - currentAngle * Math.PI / 180;
+
+  const scanX = centerX + Math.cos(scanRad) * radius;
+  const scanY = centerY - Math.sin(scanRad) * radius;
+
+  ctx.beginPath();
+  ctx.moveTo(centerX, centerY);
+  ctx.lineTo(scanX, scanY);
+
+  ctx.strokeStyle = "#65ff9c";
+  ctx.lineWidth = 3;
+  ctx.stroke();
+
+  // 중심점
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, 5, 0, Math.PI * 2);
+
+  ctx.fillStyle = "#b8ffd0";
+  ctx.fill();
+
+  // 화면 갱신
+  requestAnimationFrame(drawRadar);
+}
+
+// 초기 화면
+drawRadar();
+</script>
+</body>
+</html>
