@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>micro:bit 레이더</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #021008; color: #4dff88;
+    font-family: system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #ui { position: fixed; top: 12px; left: 12px; right: 12px; display: flex;
+    gap: 8px; align-items: center; flex-wrap: wrap; }
+  button, select { background: #0a2a16; color: #4dff88; border: 1px solid #1f7a42;
+    border-radius: 8px; padding: 10px 16px; font-size: 16px; }
+  #status { font-size: 14px; opacity: .85; }
+  #info { position: fixed; bottom: 12px; right: 16px; font-size: 18px;
+    font-variant-numeric: tabular-nums; text-align: right; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="ui">
+  <button id="connect">micro:bit 연결</button>
+  <button id="demo">데모</button>
+  <select id="range">
+    <option value="50">50cm</option>
+    <option value="100">100cm</option>
+    <option value="200" selected>200cm</option>
+    <option value="400">400cm</option>
+  </select>
+  <select id="flip">
+    <option value="0">0° = 오른쪽</option>
+    <option value="1">0° = 왼쪽</option>
+  </select>
+  <span id="status">연결 안 됨</span>
+</div>
+<div id="info"></div>
+
+<script>
+const UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const UART_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // micro:bit → 웹
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const infoEl = document.getElementById('info');
+const rangeSel = document.getElementById('range');
+const flipSel = document.getElementById('flip');
+
+let W, H, dpr;
+let curAngle = 0;     // 현재 서보 각도
+let curDist = 0;
+let points = [];      // {a, d, t}
+const FADE_MS = 4000; // 점이 사라지는 시간
+let trail = [];       // 스윕 잔상용 최근 각도들
+
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- 데이터 수신 ----------
+function handleLine(line) {
+  const m = line.trim().match(/^(\d+),(\d+)$/);
+  if (!m) return;
+  const a = Number(m[1]), d = Number(m[2]);
+  curAngle = a; curDist = d;
+  trail.push(a); if (trail.length > 25) trail.shift();
+  // 0 = 에코 없음(감지 안 됨), 최대 범위 밖도 무시
+  if (d > 0 && d <= Number(rangeSel.value)) {
+    points.push({ a, d, t: performance.now() });
+  }
+}
+
+let device = null, rxBuf = '';
+const decoder = new TextDecoder();
+
+async function connect() {
+  try {
+    statusEl.textContent = '기기 선택 중...';
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'BBC micro:bit' }],
+      optionalServices: [UART_SERVICE]
+    });
+    device.addEventListener('gattserverdisconnected', () => {
+      statusEl.textContent = '연결 끊김';
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(UART_SERVICE);
+    const tx = await service.getCharacteristic(UART_TX);
+    await tx.startNotifications();
+    tx.addEventListener('characteristicvaluechanged', e => {
+      rxBuf += decoder.decode(e.target.value);
+      let i;
+      while ((i = rxBuf.indexOf('\n')) >= 0) {
+        handleLine(rxBuf.slice(0, i));
+        rxBuf = rxBuf.slice(i + 1);
+      }
+    });
+    stopDemo();
+    statusEl.textContent = '연결됨: ' + device.name;
+  } catch (err) {
+    statusEl.textContent = '연결 실패: ' + err.message;
+  }
+}
+
+document.getElementById('connect').onclick = () => {
+  if (!navigator.bluetooth) {
+    statusEl.textContent = 'Web Bluetooth 미지원 (Chrome + HTTPS 필요)';
+    return;
+  }
+  connect();
+};
+
+// ---------- 데모 모드 (기기 없이 테스트) ----------
+let demoTimer = null;
+function stopDemo() { clearInterval(demoTimer); demoTimer = null; }
+document.getElementById('demo').onclick = () => {
+  if (demoTimer) { stopDemo(); statusEl.textContent = '데모 중지'; return; }
+  let a = 0, s = 3;
+  statusEl.textContent = '데모 실행 중';
+  demoTimer = setInterval(() => {
+    const d = a > 40 && a < 70 ? 60 + Math.random() * 3 :
+              a > 120 && a < 140 ? 120 + Math.random() * 5 : 0;
+    handleLine(a + ',' + Math.round(d));
+    a += s; if (a >= 180 || a <= 0) s = -s;
+  }, 50);
+};
+
+// ---------- 그리기 ----------
+function polar(angleDeg, r, cx, cy) {
+  let a = angleDeg;
+  if (flipSel.value === '1') a = 180 - a;
+  const rad = a * Math.PI / 180;
+  return [cx + r * Math.cos(rad), cy - r * Math.sin(rad)];
+}
+
+function draw() {
+  const now = performance.now();
+  ctx.fillStyle = '#021008';
+  ctx.fillRect(0, 0, W, H);
+
+  const cx = W / 2, cy = H - 40;
+  const R = Math.max(50, Math.min(W / 2 - 24, H - 110));
+  const maxRange = Number(rangeSel.value);
+
+  // 거리 링
+  ctx.lineWidth = 1;
+  ctx.font = '13px system-ui';
+  for (let i = 1; i <= 4; i++) {
+    const r = R * i / 4;
+    ctx.strokeStyle = 'rgba(77,255,136,0.35)';
+    ctx.beginPath(); ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI); ctx.stroke();
+    ctx.fillStyle = 'rgba(77,255,136,0.7)';
+    ctx.fillText(Math.round(maxRange * i / 4) + 'cm', cx + r - 36, cy + 16);
+  }
+  // 각도선 (30° 간격)
+  for (let a = 0; a <= 180; a += 30) {
+    const [x, y] = polar(a, R, cx, cy);
+    ctx.strokeStyle = 'rgba(77,255,136,0.25)';
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+    const [lx, ly] = polar(a, R + 16, cx, cy);
+    ctx.fillStyle = 'rgba(77,255,136,0.7)';
+    ctx.fillText(a + '°', lx - 12, ly + 4);
+  }
+  // 바닥선
+  ctx.strokeStyle = 'rgba(77,255,136,0.5)';
+  ctx.beginPath(); ctx.moveTo(cx - R, cy); ctx.lineTo(cx + R, cy); ctx.stroke();
+
+  // 스윕 잔상
+  for (let i = 0; i < trail.length; i++) {
+    const [x, y] = polar(trail[i], R, cx, cy);
+    ctx.strokeStyle = `rgba(77,255,136,${(i / trail.length) * 0.35})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+  }
+  // 현재 스윕 라인
+  const [sx, sy] = polar(curAngle, R, cx, cy);
+  ctx.strokeStyle = '#4dff88'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(sx, sy); ctx.stroke();
+
+  // 감지된 점 (시간이 지나면 흐려짐)
+  points = points.filter(p => now - p.t < FADE_MS);
+  for (const p of points) {
+    const alpha = 1 - (now - p.t) / FADE_MS;
+    const [x, y] = polar(p.a, R * p.d / maxRange, cx, cy);
+    ctx.fillStyle = `rgba(255,70,70,${alpha})`;
+    ctx.beginPath(); ctx.arc(x, y, 6, 0, 2 * Math.PI); ctx.fill();
+  }
+
+  infoEl.innerHTML = `각도 ${curAngle}°<br>거리 ${curDist > 0 ? curDist + 'cm' : '--'}`;
+  requestAnimationFrame(draw);
+}
+draw();
+</script>
+</body>
+</html>
